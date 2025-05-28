@@ -1,0 +1,222 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id              String    @id @default(cuid())
+  clerkId         String    @unique
+  email           String    @unique
+  name            String?
+  imageUrl        String?
+  role            UserRole  @default(PATIENT)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  conversations   Conversation[]
+  analytics       UserAnalytics?
+  settings        UserSettings?
+  
+  @@index([clerkId])
+  @@index([email])
+}
+
+model Conversation {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  title           String?
+  persona         Persona
+  status          ConversationStatus @default(ACTIVE)
+  
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  endedAt         DateTime?
+  
+  messages        Message[]
+  metrics         ConversationMetrics?
+  exports         Export[]
+  
+  @@index([userId])
+  @@index([persona])
+  @@index([status])
+}
+
+model Message {
+  id              String    @id @default(cuid())
+  conversationId  String
+  conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  
+  role            MessageRole
+  content         String    @db.Text
+  
+  // For AI messages
+  citations       Citation[]
+  confidence      Float?
+  processingTime  Int?      // in milliseconds
+  
+  // Safety tracking
+  flagged         Boolean   @default(false)
+  flagReason      String?
+  
+  createdAt       DateTime  @default(now())
+  
+  @@index([conversationId])
+  @@index([role])
+}
+
+model Citation {
+  id              String    @id @default(cuid())
+  messageId       String
+  message         Message   @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  
+  title           String
+  url             String
+  snippet         String    @db.Text
+  relevanceScore  Float
+  source          String    // e.g., "PubMed", "Mayo Clinic"
+  
+  createdAt       DateTime  @default(now())
+  
+  @@index([messageId])
+}
+
+model ConversationMetrics {
+  id              String    @id @default(cuid())
+  conversationId  String    @unique
+  conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  
+  messageCount    Int       @default(0)
+  totalTokens     Int       @default(0)
+  avgResponseTime Int       @default(0) // in milliseconds
+  userSatisfaction Float?   // 1-5 rating
+  
+  // Engagement metrics  
+  voiceMessagesCount Int    @default(0)
+  citationsClicked   Int    @default(0)
+  
+  updatedAt       DateTime  @updatedAt
+}
+
+model UserAnalytics {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  totalConversations Int    @default(0)
+  totalMessages      Int    @default(0)
+  favoritePersona    Persona?
+  
+  // Usage patterns
+  avgSessionDuration Int    @default(0) // in seconds
+  mostActiveHour     Int?   // 0-23
+  mostActiveDay      Int?   // 0-6 (Sunday-Saturday)
+  
+  // Topic tracking
+  topTopics          String[] @default([])
+  
+  lastActiveAt       DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+model UserSettings {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Preferences
+  theme           Theme     @default(LIGHT)
+  language        String    @default("en")
+  voiceEnabled    Boolean   @default(true)
+  soundEnabled    Boolean   @default(true)
+  
+  // Privacy
+  saveHistory     Boolean   @default(true)
+  shareAnalytics  Boolean   @default(true)
+  
+  // Notifications
+  emailNotifications Boolean @default(false)
+  
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
+model Export {
+  id              String    @id @default(cuid())
+  conversationId  String
+  conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  
+  format          ExportFormat
+  url             String    // S3 or storage URL
+  expiresAt       DateTime
+  
+  createdAt       DateTime  @default(now())
+  
+  @@index([conversationId])
+}
+
+model AuditLog {
+  id              String    @id @default(cuid())
+  userId          String?
+  action          String
+  entityType      String
+  entityId        String
+  metadata        Json?
+  ipAddress       String?
+  userAgent       String?
+  
+  createdAt       DateTime  @default(now())
+  
+  @@index([userId])
+  @@index([action])
+  @@index([entityType, entityId])
+}
+
+// Enums
+enum UserRole {
+  PATIENT
+  ADMIN
+  MODERATOR
+}
+
+enum Persona {
+  PSYCHIATRIST
+  ALLERGIST
+  GERIATRICIAN
+  DERMATOLOGIST
+  PSYCHOLOGIST
+}
+
+enum ConversationStatus {
+  ACTIVE
+  ENDED
+  ARCHIVED
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum Theme {
+  LIGHT
+  DARK
+  SYSTEM
+}
+
+enum ExportFormat {
+  PDF
+  TXT
+  JSON
+}
