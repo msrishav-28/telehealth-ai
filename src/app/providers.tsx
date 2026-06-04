@@ -30,7 +30,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
             (opts.direction === 'down' && opts.result instanceof Error),
         }),
         httpBatchLink({
-          url: `${process.env.NEXT_PUBLIC_APP_URL}/api/trpc`,
+          url: '/api/trpc',
         }),
       ],
     })

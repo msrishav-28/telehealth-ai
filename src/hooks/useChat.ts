@@ -1,7 +1,6 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { trpc } from '@/lib/trpc/client';
 import { ChatMessage, ChatRequest, Citation } from '@/types/chat.types';
-import { Persona } from '@prisma/client';
 import toast from 'react-hot-toast';
 
 interface UseChatOptions {
@@ -16,8 +15,6 @@ export function useChat(conversationId?: string, options: UseChatOptions = {}) {
   const [streamingMessage, setStreamingMessage] = useState<string>('');
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const utils = trpc.useContext();
-
   // Fetch conversation history
   const { data: conversation } = trpc.chat.getConversation.useQuery(
     { conversationId: conversationId! },
@@ -27,8 +24,8 @@ export function useChat(conversationId?: string, options: UseChatOptions = {}) {
   // Send message mutation
   const sendMessageMutation = trpc.chat.sendMessage.useMutation({
     onSuccess: (data) => {
-      setMessages((prev) => [...prev, data.message]);
-      options.onSuccess?.(data.message);
+      setMessages((prev) => [...prev, data]);
+      options.onSuccess?.(data);
     },
     onError: (error) => {
       toast.error(error.message);
@@ -38,6 +35,7 @@ export function useChat(conversationId?: string, options: UseChatOptions = {}) {
 
   // Export conversation mutation
   const exportMutation = trpc.chat.exportConversation.useMutation();
+  const deleteConversationMutation = trpc.chat.deleteConversation.useMutation();
 
   // Send message with streaming support
   const sendMessage = useCallback(
@@ -113,42 +111,42 @@ export function useChat(conversationId?: string, options: UseChatOptions = {}) {
                 const data = line.slice(6);
                 if (data === '[DONE]') continue;
 
+                let parsed: { type?: string; content?: string; citations?: Citation[]; error?: string };
                 try {
-                  const parsed = JSON.parse(data);
-                  
-                  if (parsed.type === 'content') {
-                    accumulatedContent += parsed.content;
-                    setStreamingMessage(accumulatedContent);
-                    
-                    // Update the assistant message
-                    setMessages((prev) =>
-                      prev.map((msg) =>
-                        msg.id === messageId + '-assistant'
-                          ? { ...msg, content: accumulatedContent }
-                          : msg
-                      )
-                    );
-                  } else if (parsed.type === 'citations') {
-                    citations = parsed.citations;
-                  } else if (parsed.type === 'done') {
-                    // Finalize the message
-                    setMessages((prev) =>
-                      prev.map((msg) =>
-                        msg.id === messageId + '-assistant'
-                          ? {
-                              ...msg,
-                              content: accumulatedContent,
-                              citations,
-                              isStreaming: false,
-                            }
-                          : msg
-                      )
-                    );
-                  } else if (parsed.type === 'error') {
-                    throw new Error(parsed.error);
-                  }
+                  parsed = JSON.parse(data);
                 } catch (e) {
                   console.error('Failed to parse SSE data:', e);
+                  continue;
+                }
+
+                if (parsed.type === 'content') {
+                  accumulatedContent += parsed.content ?? '';
+                  setStreamingMessage(accumulatedContent);
+
+                  setMessages((prev) =>
+                    prev.map((msg) =>
+                      msg.id === messageId + '-assistant'
+                        ? { ...msg, content: accumulatedContent }
+                        : msg
+                    )
+                  );
+                } else if (parsed.type === 'citations') {
+                  citations = parsed.citations ?? [];
+                } else if (parsed.type === 'done') {
+                  setMessages((prev) =>
+                    prev.map((msg) =>
+                      msg.id === messageId + '-assistant'
+                        ? {
+                            ...msg,
+                            content: accumulatedContent,
+                            citations,
+                            isStreaming: false,
+                          }
+                        : msg
+                    )
+                  );
+                } else if (parsed.type === 'error') {
+                  throw new Error(parsed.error ?? 'Streaming failed');
                 }
               }
             }
@@ -203,13 +201,24 @@ export function useChat(conversationId?: string, options: UseChatOptions = {}) {
     [conversationId, exportMutation]
   );
 
-  // Clear conversation (client-side only)
-  const clearConversation = useCallback(() => {
-    setMessages([]);
-  }, []);
+  // Archive the active conversation server-side, then clear local state.
+  const clearConversation = useCallback(async () => {
+    if (!conversationId) {
+      setMessages([]);
+      return;
+    }
+
+    try {
+      await deleteConversationMutation.mutateAsync({ conversationId });
+      setMessages([]);
+      toast.success('Conversation cleared');
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to clear conversation');
+    }
+  }, [conversationId, deleteConversationMutation]);
 
   // Update messages when conversation data loads
-  useState(() => {
+  useEffect(() => {
     if (conversation?.messages) {
       setMessages(
         conversation.messages.map((msg) => ({
@@ -221,7 +230,7 @@ export function useChat(conversationId?: string, options: UseChatOptions = {}) {
         }))
       );
     }
-  });
+  }, [conversation?.messages]);
 
   return {
     messages,

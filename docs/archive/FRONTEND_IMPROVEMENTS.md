@@ -1,3 +1,15 @@
+# Historical Context
+
+This file is preserved only for historical product/development context.
+
+Do not treat this as current implementation truth.
+
+All claims here must be verified against the codebase during Phase 2.
+
+Archived material should not be used as direct coding instructions unless Phase 2 confirms it matches the actual implementation.
+
+---
+
 # Frontend Improvements for TeleHealth AI
 
 ## 🎨 UI/UX Enhancements
