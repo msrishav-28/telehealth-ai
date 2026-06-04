@@ -63,24 +63,9 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Handle API requests
+  // API responses can contain authenticated health data. Never cache them.
   if (url.pathname.startsWith('/api/')) {
-    event.respondWith(
-      fetch(request)
-        .then((response) => {
-          // Cache successful API responses for offline access
-          if (response.ok && request.url.includes('/api/chat/')) {
-            const responseClone = response.clone();
-            caches.open(DYNAMIC_CACHE_NAME)
-              .then((cache) => cache.put(request, responseClone));
-          }
-          return response;
-        })
-        .catch(() => {
-          // Return cached response if available
-          return caches.match(request);
-        })
-    );
+    event.respondWith(fetch(request));
     return;
   }
 
@@ -165,36 +150,3 @@ self.addEventListener('notificationclick', (event) => {
       })
   );
 });
-
-// Background sync event (for offline message queue)
-self.addEventListener('sync', (event) => {
-  if (event.tag === 'background-sync-messages') {
-    event.waitUntil(
-      // Process queued messages when back online
-      processQueuedMessages()
-    );
-  }
-});
-
-async function processQueuedMessages() {
-  try {
-    const cache = await caches.open(DYNAMIC_CACHE_NAME);
-    const requests = await cache.keys();
-    
-    const queuedMessages = requests.filter(request => 
-      request.url.includes('/api/chat/send') && 
-      request.headers.get('x-queued') === 'true'
-    );
-
-    for (const request of queuedMessages) {
-      try {
-        await fetch(request);
-        await cache.delete(request);
-      } catch (error) {
-        console.error('Failed to send queued message:', error);
-      }
-    }
-  } catch (error) {
-    console.error('Error processing queued messages:', error);
-  }
-}

@@ -78,7 +78,7 @@ export async function generateText(prompt: string): Promise<string> {
  */
 export async function generateStreamingText(
   prompt: string,
-  onChunk: (text: string) => void
+  onChunk: (text: string) => void | Promise<void>
 ): Promise<void> {
   const model = getGeminiModel();
   
@@ -87,7 +87,7 @@ export async function generateStreamingText(
     
     for await (const chunk of result.stream) {
       const chunkText = chunk.text();
-      onChunk(chunkText);
+      await onChunk(chunkText);
     }
   } catch (error: any) {
     if (error.message?.includes('SAFETY')) {

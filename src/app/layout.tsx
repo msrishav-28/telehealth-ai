@@ -11,6 +11,8 @@ import { AccessibilityProvider } from '@/components/enhanced/AccessibilityProvid
 import { ErrorBoundary } from '@/components/enhanced/ErrorBoundary';
 import { OfflineIndicator } from '@/components/enhanced/OfflineIndicator';
 import { PWAInstallPrompt } from '@/components/enhanced/PWAInstallPrompt';
+import { ServiceWorkerRegistrar } from '@/components/enhanced/ServiceWorkerRegistrar';
+import { WebVitalsReporter } from '@/components/enhanced/WebVitalsReporter';
 import './globals.css';
 
 const inter = Inter({ 
@@ -95,24 +97,6 @@ export default function RootLayout({
           <link rel="dns-prefetch" href="https://api.perplexity.ai" />
           <link rel="dns-prefetch" href="https://clerk.dev" />
           
-          {/* Service Worker Registration */}
-          <script
-            dangerouslySetInnerHTML={{
-              __html: `
-                if ('serviceWorker' in navigator) {
-                  window.addEventListener('load', function() {
-                    navigator.serviceWorker.register('/sw.js')
-                      .then(function(registration) {
-                        console.log('SW registered: ', registration);
-                      })
-                      .catch(function(registrationError) {
-                        console.log('SW registration failed: ', registrationError);
-                      });
-                  });
-                }
-              `,
-            }}
-          />
         </head>
         <body className={`${inter.variable} font-sans antialiased mobile-optimized`}>
           <ErrorBoundary>
@@ -164,33 +148,8 @@ export default function RootLayout({
           <Analytics />
           <SpeedInsights />
           
-          {/* Performance Monitoring */}
-          <script
-            dangerouslySetInnerHTML={{
-              __html: `
-                // Web Vitals monitoring
-                import('web-vitals').then(({ getCLS, getFID, getFCP, getLCP, getTTFB }) => {
-                  function sendToAnalytics(metric) {
-                    // Send to your analytics service
-                    if (typeof gtag !== 'undefined') {
-                      gtag('event', metric.name, {
-                        event_category: 'Web Vitals',
-                        event_label: metric.id,
-                        value: Math.round(metric.name === 'CLS' ? metric.value * 1000 : metric.value),
-                        non_interaction: true,
-                      });
-                    }
-                  }
-                  
-                  getCLS(sendToAnalytics);
-                  getFID(sendToAnalytics);
-                  getFCP(sendToAnalytics);
-                  getLCP(sendToAnalytics);
-                  getTTFB(sendToAnalytics);
-                });
-              `,
-            }}
-          />
+          <ServiceWorkerRegistrar />
+          <WebVitalsReporter />
         </body>
       </html>
     </ClerkProvider>

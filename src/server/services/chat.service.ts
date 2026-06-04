@@ -1,30 +1,38 @@
-import { Persona, MessageRole } from '@prisma/client';
+import { MessageRole, Persona } from '@prisma/client';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { TRPCError } from '@trpc/server';
-import { z } from 'zod';
 import { prisma } from '@/lib/db/prisma';
+import { getPersonaConfig } from '@/lib/personas/base';
 import { PerplexityService } from './perplexity.service';
-import { getPersonaConfig, RED_FLAG_KEYWORDS } from '@/lib/personas/base';
 import { ChatMessage, RedFlag } from '@/types/chat.types';
 import { PIIFilter } from '@/lib/safety/pii-filter';
 import { ContentModerator } from '@/lib/safety/content-moderator';
 
-// Initialize Gemini
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? '');
+
+const emergencyKeywords = [
+  'chest pain',
+  'difficulty breathing',
+  'shortness of breath',
+  'suicide',
+  'kill myself',
+  'stroke',
+  'seizure',
+  'unconscious',
+  'anaphylaxis',
+];
 
 export class ChatService {
   private perplexity: PerplexityService;
   private piiFilter: PIIFilter;
   private contentModerator: ContentModerator;
-  private model: any;
+  private model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>;
 
   constructor() {
     this.perplexity = new PerplexityService();
     this.piiFilter = new PIIFilter();
     this.contentModerator = new ContentModerator();
-    
-    // Initialize Gemini Pro model (free tier)
-    this.model = genAI.getGenerativeModel({ 
+    this.model = genAI.getGenerativeModel({
       model: 'gemini-pro',
       generationConfig: {
         temperature: 0.7,
@@ -33,30 +41,14 @@ export class ChatService {
         maxOutputTokens: 1000,
       },
       safetySettings: [
-        {
-          category: 'HARM_CATEGORY_HARASSMENT',
-          threshold: 'BLOCK_MEDIUM_AND_ABOVE',
-        },
-        {
-          category: 'HARM_CATEGORY_HATE_SPEECH',
-          threshold: 'BLOCK_MEDIUM_AND_ABOVE',
-        },
-        {
-          category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT',
-          threshold: 'BLOCK_MEDIUM_AND_ABOVE',
-        },
-        {
-          category: 'HARM_CATEGORY_DANGEROUS_CONTENT',
-          threshold: 'BLOCK_MEDIUM_AND_ABOVE',
-        },
+        { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+        { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
       ],
     });
   }
-  }
 
-  /**
-   * Process a chat message
-   */
   async processMessage({
     userId,
     conversationId,
@@ -68,205 +60,238 @@ export class ChatService {
     message: string;
     persona: Persona;
   }): Promise<ChatMessage> {
-    try {
-      // 1. Safety checks
-      const redFlag = this.checkRedFlags(message);
-      if (redFlag) {
-        return this.createEmergencyResponse(conversationId, redFlag);
-      }
-
-      // 2. Filter PII
-      const filteredMessage = await this.piiFilter.filter(message);
-
-      // 3. Content moderation
-      const moderationResult = await this.contentModerator.moderate(filteredMessage);
-      if (moderationResult.blocked) {
-        throw new TRPCError({
-          code: 'BAD_REQUEST',
-          message: 'Message contains inappropriate content',
-        });
-      }
-
-      // 4. Get conversation context
-      const conversation = await prisma.conversation.findUnique({
-        where: { id: conversationId },
-        include: {
-          messages: {
-            orderBy: { createdAt: 'desc' },
-            take: 10,
-          },
+    const conversation = await prisma.conversation.findFirst({
+      where: { id: conversationId, userId, status: 'ACTIVE' },
+      include: {
+        messages: {
+          orderBy: { createdAt: 'desc' },
+          take: 10,
         },
+      },
+    });
+
+    if (!conversation) {
+      throw new TRPCError({ code: 'NOT_FOUND', message: 'Conversation not found' });
+    }
+
+    const redFlag = this.checkRedFlags(message);
+    if (redFlag) {
+      await this.saveUserMessage(conversationId, message, true, `Red flag detected: ${redFlag.severity}`);
+      await this.logConversation(userId, conversationId, 'red_flag_detected', { severity: redFlag.severity });
+      return this.createEmergencyResponse(conversationId, redFlag);
+    }
+
+    const filteredMessage = await this.piiFilter.filter(message);
+    const moderationResult = await this.contentModerator.moderate(filteredMessage);
+
+    if (moderationResult.blocked) {
+      throw new TRPCError({
+        code: 'BAD_REQUEST',
+        message: 'Message contains content that cannot be processed safely.',
       });
+    }
 
-      if (!conversation || conversation.userId !== userId) {
-        throw new TRPCError({
-          code: 'NOT_FOUND',
-          message: 'Conversation not found',
-        });
-      }
+    await this.saveUserMessage(
+      conversationId,
+      filteredMessage,
+      moderationResult.flagged,
+      moderationResult.reason,
+    );
 
-      // 5. Save user message
-      const userMessage = await prisma.message.create({
+    const searchQuery = this.constructSearchQuery(filteredMessage, persona);
+    const searchResults = await this.getSearchResults(searchQuery, userId);
+    const systemPrompt = this.constructSystemPrompt(persona, searchResults);
+    const conversationHistory = this.constructConversationHistory(conversation.messages, filteredMessage);
+    const startTime = Date.now();
+
+    try {
+      const fullPrompt = `${systemPrompt}\n\nConversation History:\n${conversationHistory}\n\nPlease provide a helpful, empathetic response following the guidelines above.`;
+      const result = await this.model.generateContent(fullPrompt);
+      const response = await result.response;
+      const responseContent = response.text();
+      const processingTime = Date.now() - startTime;
+
+      const aiMessage = await prisma.message.create({
         data: {
           conversationId,
-          role: MessageRole.USER,
-          content: filteredMessage,
-          flagged: moderationResult.flagged,
-          flagReason: moderationResult.reason,
+          role: MessageRole.ASSISTANT,
+          content: responseContent,
+          processingTime,
+          citations: {
+            create: searchResults.citations.map((citation) => ({
+              title: citation.title,
+              url: citation.url,
+              snippet: citation.snippet,
+              relevanceScore: citation.relevanceScore,
+              source: citation.source,
+            })),
+          },
         },
+        include: { citations: true },
       });
 
-      // 6. Search for medical information
-      const searchQuery = this.constructSearchQuery(filteredMessage, persona);
-      const searchResults = await this.perplexity.searchMedical(searchQuery);
+      await this.updateConversationMetrics(conversationId, responseContent.length);
+      await this.logConversation(userId, conversationId, 'message_sent');
 
-      // 7. Construct AI prompt
-      const systemPrompt = this.constructSystemPrompt(persona, searchResults);
-      const conversationHistory = this.constructConversationHistory(conversation.messages, filteredMessage);
-
-      // 8. Get AI response using Gemini
-      const startTime = Date.now();
-      
-      try {
-        // Combine system prompt and conversation into a single prompt for Gemini
-        const fullPrompt = `${systemPrompt}\n\nConversation History:\n${conversationHistory}\n\nPlease provide a helpful, empathetic response following the guidelines above.`;
-        
-        const result = await this.model.generateContent(fullPrompt);
-        const response = await result.response;
-        const responseContent = response.text();
-        const processingTime = Date.now() - startTime;
-
-        // 9. Save AI response with citations
-        const aiMessage = await prisma.message.create({
-          data: {
-            conversationId,
-            role: MessageRole.ASSISTANT,
-            content: responseContent,
-            processingTime,
-            citations: {
-              create: searchResults.citations.map(citation => ({
-                title: citation.title,
-                url: citation.url,
-                snippet: citation.snippet,
-                relevanceScore: citation.relevanceScore,
-                source: citation.source,
-              })),
-            },
-          },
-          include: {
-            citations: true,
-          },
-        });
-
-        // 10. Update conversation metrics
-        await this.updateConversationMetrics(conversationId, responseContent.length);
-
-        // 11. Log for audit
-        await this.logConversation(userId, conversationId, 'message_sent');
-
-        return {
-          id: aiMessage.id,
-          role: aiMessage.role,
-          content: aiMessage.content,
-          citations: aiMessage.citations,
-          timestamp: aiMessage.createdAt,
-        };
-      } catch (error: any) {
-        // Handle Gemini-specific errors
-        if (error.message?.includes('SAFETY')) {
-          throw new TRPCError({
-            code: 'BAD_REQUEST',
-            message: 'Your message was blocked by safety filters. Please rephrase your question.',
-          });
-        }
-        
+      return {
+        id: aiMessage.id,
+        role: aiMessage.role,
+        content: aiMessage.content,
+        citations: aiMessage.citations,
+        timestamp: aiMessage.createdAt,
+      };
+    } catch (error: any) {
+      if (error.message?.includes('SAFETY')) {
         throw new TRPCError({
-          code: 'INTERNAL_SERVER_ERROR',
-          message: 'Failed to generate response. Please try again.',
+          code: 'BAD_REQUEST',
+          message: 'Your message was blocked by safety filters. Please rephrase your question.',
         });
       }
 
-    } catch (error) {
-      console.error('Chat processing error:', error);
-      
-      if (error instanceof TRPCError) throw error;
-      
       throw new TRPCError({
         code: 'INTERNAL_SERVER_ERROR',
-        message: 'Failed to process message',
+        message: 'Failed to generate response. Please try again.',
       });
     }
   }
 
-  /**
-   * Check for red flag keywords
-   */
-  private checkRedFlags(message: string): RedFlag | null {
+  async getConversationHistory(userId: string, conversationId: string) {
+    const conversation = await prisma.conversation.findFirst({
+      where: { id: conversationId, userId, status: 'ACTIVE' },
+      include: {
+        messages: {
+          include: { citations: true },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+    });
+
+    if (!conversation) {
+      throw new TRPCError({ code: 'NOT_FOUND', message: 'Conversation not found' });
+    }
+
+    return conversation;
+  }
+
+  async createConversation(userId: string, persona: Persona) {
+    const personaConfig = getPersonaConfig(persona);
+
+    return prisma.conversation.create({
+      data: {
+        userId,
+        persona,
+        title: `Chat with ${personaConfig.name}`,
+        messages: {
+          create: {
+            role: MessageRole.ASSISTANT,
+            content: personaConfig.greeting,
+          },
+        },
+        metrics: {
+          create: {
+            messageCount: 1,
+            totalTokens: personaConfig.greeting.length,
+          },
+        },
+      },
+      include: { messages: true, metrics: true },
+    });
+  }
+
+  async exportConversation(userId: string, conversationId: string, _format: 'PDF' | 'TXT' | 'JSON') {
+    await this.getConversationHistory(userId, conversationId);
+
+    throw new TRPCError({
+      code: 'PRECONDITION_FAILED',
+      message: 'Conversation export is not implemented yet.',
+    });
+  }
+
+  async persistAssistantMessage({
+    userId,
+    conversationId,
+    content,
+    citations,
+    processingTime,
+  }: {
+    userId: string;
+    conversationId: string;
+    content: string;
+    citations: Array<{ title: string; url: string; snippet: string; relevanceScore?: number; source?: string }>;
+    processingTime?: number;
+  }) {
+    const conversation = await prisma.conversation.findFirst({
+      where: { id: conversationId, userId, status: 'ACTIVE' },
+      select: { id: true },
+    });
+
+    if (!conversation) {
+      throw new TRPCError({ code: 'NOT_FOUND', message: 'Conversation not found' });
+    }
+
+    const message = await prisma.message.create({
+      data: {
+        conversationId,
+        role: MessageRole.ASSISTANT,
+        content,
+        processingTime,
+        citations: {
+          create: citations.map((citation) => ({
+            title: citation.title,
+            url: citation.url,
+            snippet: citation.snippet,
+            relevanceScore: citation.relevanceScore,
+            source: citation.source,
+          })),
+        },
+      },
+      include: { citations: true },
+    });
+
+    await this.updateConversationMetrics(conversationId, content.length);
+    await this.logConversation(userId, conversationId, 'stream_message_sent');
+
+    return message;
+  }
+
+  async saveUserMessage(
+    conversationId: string,
+    content: string,
+    flagged = false,
+    flagReason?: string,
+  ) {
+    return prisma.message.create({
+      data: {
+        conversationId,
+        role: MessageRole.USER,
+        content,
+        flagged,
+        flagReason,
+      },
+    });
+  }
+
+  checkRedFlags(message: string): RedFlag | null {
     const lowerMessage = message.toLowerCase();
-    
-    // Emergency keywords
-    const emergencyKeywords = [
-      'suicide', 'kill myself', 'end my life',
-      'chest pain', 'heart attack', 'stroke',
-      'can\'t breathe', 'severe bleeding',
-    ];
-    
+
     for (const keyword of emergencyKeywords) {
       if (lowerMessage.includes(keyword)) {
         return {
           id: 'emergency',
           patterns: [keyword],
           severity: 'emergency',
-          message: 'This seems like an emergency situation. Please call emergency services immediately.',
+          message: 'This may be an emergency. Please contact emergency services or seek urgent in-person medical care now.',
           action: 'alert',
           phoneNumbers: ['911 (US)', '999 (UK)', '112 (EU)'],
         };
       }
     }
-    
-    // High urgency keywords
-    const urgentKeywords = [
-      'severe pain', 'unconscious', 'seizure',
-      'allergic reaction', 'anaphylaxis',
-    ];
-    
-    for (const keyword of urgentKeywords) {
-      if (lowerMessage.includes(keyword)) {
-        return {
-          id: 'urgent',
-          patterns: [keyword],
-          severity: 'urgent',
-          message: 'This sounds like an urgent medical situation. Please seek immediate medical care.',
-          action: 'alert',
-        };
-      }
-    }
-    
+
     return null;
   }
 
-  /**
-   * Create emergency response
-   */
-  private async createEmergencyResponse(
-    conversationId: string,
-    redFlag: RedFlag
-  ): Promise<ChatMessage> {
-    const emergencyContent = `
-⚠️ **IMPORTANT SAFETY ALERT** ⚠️
-
-${redFlag.message}
-
-**Emergency Contacts:**
-${redFlag.phoneNumbers?.map(num => `• ${num}`).join('\n') || '• Call your local emergency number'}
-
-**What to do right now:**
-1. If you're in immediate danger, call emergency services
-2. If possible, have someone stay with you
-3. Go to the nearest emergency room if you can't call
-
-**Remember:** This AI cannot provide emergency medical care. Please get help from real medical professionals immediately.
-    `.trim();
+  private async createEmergencyResponse(conversationId: string, redFlag: RedFlag): Promise<ChatMessage> {
+    const emergencyContent = `⚠️ **IMPORTANT SAFETY ALERT** ⚠️\n\n${redFlag.message}\n\n**Emergency Contacts:**\n${redFlag.phoneNumbers?.map((num) => `• ${num}`).join('\n') ?? '• Call your local emergency number'}\n\nThis AI cannot provide emergency medical care. Please get help from real medical professionals immediately.`;
 
     const message = await prisma.message.create({
       data: {
@@ -287,61 +312,39 @@ ${redFlag.phoneNumbers?.map(num => `• ${num}`).join('\n') || '• Call your lo
     };
   }
 
-  /**
-   * Construct search query for Perplexity
-   */
+  private async getSearchResults(query: string, userId: string) {
+    try {
+      return await this.perplexity.searchMedical(query, {}, userId);
+    } catch {
+      return {
+        content: 'No external citations were available for this response. The assistant should clearly state this limitation.',
+        citations: [],
+      };
+    }
+  }
+
   private constructSearchQuery(message: string, persona: Persona): string {
     const personaConfig = getPersonaConfig(persona);
     const specialtyContext = personaConfig.specialties.join(', ');
-    
     return `${message} (context: ${personaConfig.title} specializing in ${specialtyContext})`;
   }
 
-  /**
-   * Construct system prompt with citations
-   */
-  private constructSystemPrompt(persona: Persona, searchResults: any): string {
+  private constructSystemPrompt(persona: Persona, searchResults: { content: string }): string {
     const personaConfig = getPersonaConfig(persona);
-    
-    return `
-${personaConfig.systemPrompt}
 
-CITATIONS AND SOURCES:
-You have access to the following medical information from reputable sources. 
-Please incorporate this information into your response and reference it appropriately:
-
-${searchResults.content}
-
-IMPORTANT INSTRUCTIONS:
-1. Base your response on the provided citations
-2. Mention specific sources when making medical claims
-3. If the citations don't cover something, acknowledge the limitation
-4. Always maintain the safety guidelines in your persona prompt
-    `.trim();
+    return `${personaConfig.systemPrompt}\n\nCITATIONS AND SOURCES:\n${searchResults.content}\n\nIMPORTANT INSTRUCTIONS:\n1. Base medical claims on the provided citations when available.\n2. If citations are unavailable or incomplete, acknowledge the limitation.\n3. Always recommend appropriate professional care and emergency escalation when needed.`;
   }
 
-  /**
-   * Construct conversation history for Gemini
-   */
-  private constructConversationHistory(
-    messages: any[],
-    currentMessage: string
-  ): string {
-    const history = messages
+  private constructConversationHistory(messages: Array<{ role: MessageRole; content: string }>, currentMessage: string): string {
+    const history = [...messages]
       .reverse()
-      .slice(0, 5) // Last 5 messages for context
-      .map(msg => {
-        const role = msg.role === MessageRole.USER ? 'User' : 'Assistant';
-        return `${role}: ${msg.content}`;
-      })
+      .slice(0, 5)
+      .map((msg) => `${msg.role === MessageRole.USER ? 'User' : 'Assistant'}: ${msg.content}`)
       .join('\n\n');
-    
+
     return `${history}\n\nUser: ${currentMessage}`;
   }
 
-  /**
-   * Update conversation metrics
-   */
   private async updateConversationMetrics(conversationId: string, tokens: number) {
     await prisma.conversationMetrics.upsert({
       where: { conversationId },
@@ -355,12 +358,14 @@ IMPORTANT INSTRUCTIONS:
         totalTokens: { increment: tokens },
       },
     });
+
+    await prisma.conversation.update({
+      where: { id: conversationId },
+      data: { updatedAt: new Date() },
+    });
   }
 
-  /**
-   * Log conversation for audit
-   */
-  private async logConversation(userId: string, conversationId: string, action: string) {
+  private async logConversation(userId: string, conversationId: string, action: string, metadata?: Record<string, unknown>) {
     await prisma.auditLog.create({
       data: {
         userId,
@@ -369,84 +374,9 @@ IMPORTANT INSTRUCTIONS:
         entityId: conversationId,
         metadata: {
           timestamp: new Date().toISOString(),
+          ...metadata,
         },
       },
     });
-  }
-
-  /**
-   * Get conversation history
-   */
-  async getConversationHistory(userId: string, conversationId: string) {
-    const conversation = await prisma.conversation.findFirst({
-      where: {
-        id: conversationId,
-        userId,
-      },
-      include: {
-        messages: {
-          include: {
-            citations: true,
-          },
-          orderBy: { createdAt: 'asc' },
-        },
-      },
-    });
-
-    if (!conversation) {
-      throw new TRPCError({
-        code: 'NOT_FOUND',
-        message: 'Conversation not found',
-      });
-    }
-
-    return conversation;
-  }
-
-  /**
-   * Create a new conversation
-   */
-  async createConversation(userId: string, persona: Persona) {
-    const personaConfig = getPersonaConfig(persona);
-    
-    const conversation = await prisma.conversation.create({
-      data: {
-        userId,
-        persona,
-        title: `Chat with ${personaConfig.name}`,
-        messages: {
-          create: {
-            role: MessageRole.ASSISTANT,
-            content: personaConfig.greeting,
-          },
-        },
-      },
-      include: {
-        messages: true,
-      },
-    });
-
-    return conversation;
-  }
-
-  /**
-   * Export conversation as PDF
-   */
-  async exportConversation(userId: string, conversationId: string, format: 'PDF' | 'TXT' | 'JSON') {
-    const conversation = await this.getConversationHistory(userId, conversationId);
-    
-    // Generate export based on format
-    // This would integrate with a PDF generation service
-    
-    const exportRecord = await prisma.export.create({
-      data: {
-        conversationId,
-        format,
-        url: 'https://example.com/export.pdf', // Replace with actual URL
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
-      },
-    });
-
-    return exportRecord.url;
   }
 }

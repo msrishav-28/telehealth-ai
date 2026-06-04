@@ -40,15 +40,20 @@ const PerplexityResponseSchema = z.object({
 });
 
 export class PerplexityService {
-  private redis: Redis;
-  private rateLimiter: Ratelimit;
+  private redis?: Redis;
+  private rateLimiter?: Ratelimit;
 
   constructor() {
-    this.redis = Redis.fromEnv();
-    this.rateLimiter = new Ratelimit({
-      redis: this.redis,
-      limiter: Ratelimit.slidingWindow(10, '1 m'), // 10 requests per minute
-    });
+    try {
+      this.redis = Redis.fromEnv();
+      this.rateLimiter = new Ratelimit({
+        redis: this.redis,
+        limiter: Ratelimit.slidingWindow(10, '1 m'),
+      });
+    } catch {
+      this.redis = undefined;
+      this.rateLimiter = undefined;
+    }
   }
 
   /**
@@ -71,25 +76,28 @@ export class PerplexityService {
       maxResults?: number;
       sources?: string[];
       recency?: 'day' | 'week' | 'month' | 'year';
-    } = {}
+    } = {},
+    rateLimitKey = 'anonymous'
   ): Promise<{
     content: string;
     citations: Citation[];
   }> {
-    // Check rate limit
-    const { success } = await this.rateLimiter.limit('global');
-    if (!success) {
-      throw new TRPCError({
-        code: 'TOO_MANY_REQUESTS',
-        message: 'Rate limit exceeded. Please try again later.',
-      });
+    if (this.rateLimiter) {
+      const { success } = await this.rateLimiter.limit(rateLimitKey);
+      if (!success) {
+        throw new TRPCError({
+          code: 'TOO_MANY_REQUESTS',
+          message: 'Rate limit exceeded. Please try again later.',
+        });
+      }
     }
 
-    // Check cache
     const cacheKey = this.getCacheKey(query, options);
-    const cached = await this.redis.get(cacheKey);
-    if (cached) {
-      return cached as { content: string; citations: Citation[] };
+    if (this.redis) {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        return cached as { content: string; citations: Citation[] };
+      }
     }
 
     if (!PERPLEXITY_API_KEY) {
@@ -154,8 +162,9 @@ export class PerplexityService {
 
       const result = { content, citations };
 
-      // Cache the result
-      await this.redis.set(cacheKey, result, { ex: CACHE_TTL });
+      if (this.redis) {
+        await this.redis.set(cacheKey, result, { ex: CACHE_TTL });
+      }
 
       return result;
     } catch (error) {
@@ -172,7 +181,7 @@ export class PerplexityService {
   /**
    * Check drug interactions using Perplexity
    */
-  async checkDrugInteractions(drugs: string[]): Promise<{
+  async checkDrugInteractions(drugs: string[], rateLimitKey?: string): Promise<{
     interactions: Array<{
       drugs: string[];
       severity: 'minor' | 'moderate' | 'major';
@@ -190,7 +199,7 @@ export class PerplexityService {
         'medscape.com',
         'ncbi.nlm.nih.gov',
       ],
-    });
+    }, rateLimitKey ?? 'drug-interactions');
 
     // Parse the response to extract structured interaction data
     const interactions = this.parseInteractionsFromContent(result.content, drugs);
@@ -208,7 +217,7 @@ export class PerplexityService {
     age?: number;
     gender?: string;
     medications?: string[];
-  }): Promise<{
+  }, rateLimitKey?: string): Promise<{
     overview: string;
     possibleCauses: string[];
     whenToSeekHelp: string[];
@@ -227,7 +236,7 @@ export class PerplexityService {
     
     query += ` Include possible causes, when to seek medical help, and safe home remedies.`;
 
-    const result = await this.searchMedical(query);
+    const result = await this.searchMedical(query, {}, rateLimitKey ?? 'symptom-info');
 
     // Parse structured information from the content
     return {
