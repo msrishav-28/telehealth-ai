@@ -10,9 +10,6 @@ const nextConfig = {
     domains: ['clerk.dev', 'img.clerk.com', 'images.clerk.dev'],
     formats: ['image/webp', 'image/avif'],
   },
-  experimental: {
-    serverActions: true,
-  },
   webpack: (config, { dev, isServer }) => {
     config.externals.push({
       'utf-8-validate': 'commonjs utf-8-validate',

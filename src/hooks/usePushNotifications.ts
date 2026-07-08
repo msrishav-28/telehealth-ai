@@ -79,7 +79,7 @@ export function usePushNotifications(options: UsePushNotificationsOptions = {}) 
     try {
       const registration = await navigator.serviceWorker.ready;
       
-      const subscriptionOptions: PushSubscriptionOptions = {
+      const subscriptionOptions: PushSubscriptionOptionsInit = {
         userVisibleOnly: true,
       };
 

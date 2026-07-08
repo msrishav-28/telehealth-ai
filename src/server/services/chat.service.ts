@@ -1,5 +1,5 @@
 import { MessageRole, Persona } from '@prisma/client';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai';
 import { TRPCError } from '@trpc/server';
 import { prisma } from '@/lib/db/prisma';
 import { getPersonaConfig } from '@/lib/personas/base';
@@ -41,10 +41,10 @@ export class ChatService {
         maxOutputTokens: 1000,
       },
       safetySettings: [
-        { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
-        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
-        { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
-        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
       ],
     });
   }
@@ -240,8 +240,8 @@ export class ChatService {
             title: citation.title,
             url: citation.url,
             snippet: citation.snippet,
-            relevanceScore: citation.relevanceScore,
-            source: citation.source,
+            relevanceScore: citation.relevanceScore ?? 0.8,
+            source: citation.source ?? 'Medical Source',
           })),
         },
       },

@@ -28,15 +28,16 @@ export function useRetryableQuery<T>(
     queryKey,
     queryFn,
     retry: (failureCount, error) => {
+      const err = error instanceof Error ? error : new Error(String(error));
       if (failureCount >= maxRetries) {
         if (showErrorToast) {
-          toast.error(`Failed after ${maxRetries} attempts: ${error.message}`);
+          toast.error(`Failed after ${maxRetries} attempts: ${err.message}`);
         }
         return false;
       }
 
       const delay = retryDelay(failureCount);
-      onRetry?.(failureCount + 1, error);
+      onRetry?.(failureCount + 1, err);
       
       setTimeout(() => {
         setRetryCount(prev => prev + 1);
