@@ -29,7 +29,7 @@ export function useChat(conversationId?: string, options: UseChatOptions = {}) {
     },
     onError: (error) => {
       toast.error(error.message);
-      options.onError?.(error);
+      options.onError?.(new Error(error.message));
     },
   });
 
@@ -161,7 +161,7 @@ export function useChat(conversationId?: string, options: UseChatOptions = {}) {
         }
       } catch (error: any) {
         if (error.name === 'AbortError') {
-          toast.info('Message cancelled');
+          toast('Message cancelled');
         } else {
           toast.error(error.message || 'Failed to send message');
           options.onError?.(error);
